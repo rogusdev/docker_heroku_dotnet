@@ -25,7 +25,8 @@ vagrant ssh
 
 cat << EOF > .env
 PORT=5000
-DATABASE_URL=Host=localhost;Username=postgres;Password=;Database=postgres
+DATABASE_URL=postgres://postgres:@postgres:5432
+REDIS_URL=redis://:@redis:6379
 EOF
 
 cat << EOF > .dockerignore
@@ -167,6 +168,8 @@ dotnet add ./App.Web package Microsoft.AspNetCore.Server.Kestrel --version 2.0.0
 dotnet add ./App.Web package Microsoft.Extensions.CommandLineUtils --version 1.1.1
 dotnet add ./App.Web package Nancy --version 2.0.0-clienteastwood
 
+# exit from docker bash
+
 
 cat << EOF > App.Web/Startup.cs
 using DotNetEnv;
@@ -280,6 +283,10 @@ heroku create rogusdev-docker-heroku-dotnet
 #  https://dashboard.heroku.com/apps/rogusdev-docker-heroku-dotnet/settings
 
 heroku container:push web
+
+
+vagrant halt
+vagrant destroy
 ```
 
 
@@ -328,4 +335,182 @@ jobs:
           name: Print the Current Time
           command: date
 EOF
+```
+
+
+Actually leverage the postgres and redis connections:
+```
+cat << EOF > App.Web/PostgresModule.cs
+using System;
+using Dapper;
+using Nancy;
+
+namespace App.Web
+{
+    public class PostgresModule : NancyModule
+    {
+        public PostgresModule() : base("/postgres")
+        {
+            // this is very bad REST, I know
+            Get("/{key}/{value}", args =>
+            {
+                var key = args.key.ToString();
+                var value = args.value.ToString();
+
+                var databaseUrlString = Environment.GetEnvironmentVariable("DATABASE_URL");
+                Console.WriteLine($"DATABASE_URL from ENV: {databaseUrlString}");
+                // https://devcenter.heroku.com/articles/connecting-to-relational-databases-on-heroku-with-java#using-the-database_url-in-plain-jdbc
+                var dbUri = new Uri(databaseUrlString);
+                var userInfo = dbUri.UserInfo.Split(':');
+                var npgsqlConnString = $"Host={dbUri.Host};Port={dbUri.Port};Database={dbUri.LocalPath.Substring(1)};Username={userInfo[0]};Password={userInfo[1]}";
+                Console.WriteLine($"constructed npgsqlConnString: {npgsqlConnString}");
+
+                // https://github.com/StackExchange/Dapper
+                // http://dapper-tutorial.net/dapper
+                using (var dbConn = new Npgsql.NpgsqlConnection(npgsqlConnString))
+                {
+                    dbConn.Open();
+                    // # https://stackoverflow.com/questions/8902674/manually-map-column-names-with-class-properties/34536863#34536863
+                    Dapper.DefaultTypeMap.MatchNamesWithUnderscores = true;
+
+                    var now = DateTime.UtcNow;
+                    var id = Guid.NewGuid();
+
+                    // Insert some data
+                    var newThing = new Thing()
+                    {
+                        Id = id,
+                        Name = $"Hello world {now}: {key} = {value}",
+                        Enabled = true,
+                        CreatedAt = now.AddMinutes(-10),
+                        UpdatedAt = now.AddMinutes(10),
+                    };
+                    dbConn.Execute(
+                        "INSERT INTO things" +
+                        " (id, name, enabled, created_at, updated_at)" +
+                        " VALUES (@Id, @Name, @Enabled, @CreatedAt, @UpdatedAt)",
+                        newThing
+                    );
+                    Console.WriteLine("inserted via dapper: {0}: {1}={2}", now, key, value);
+
+                    // Retrieve all rows
+                    var things = dbConn.Query<Thing>("SELECT * FROM things");
+                    foreach (var thing in things)
+                        Console.WriteLine(thing);
+                    Console.WriteLine("read all dapper");
+
+                    var addedThing = dbConn.QuerySingleOrDefault<Thing>(
+                        "SELECT * FROM things WHERE id = @Id",
+                        new { Id = id }
+                    );
+                    Console.WriteLine("added: {0}", addedThing);
+                }
+
+                return DateTime.UtcNow.ToString();
+            });
+        }
+
+        private class Thing
+        {
+            public Guid Id { get; set; }
+            public string Name { get; set; }
+            public bool Enabled { get; set; }
+            public DateTime CreatedAt { get; set; }
+            public DateTime UpdatedAt { get; set; }
+
+            public override string ToString()
+            {
+                return $"{nameof(Id)}: {Id}, {nameof(Name)}: {Name}, {nameof(Enabled)}: {Enabled}, {nameof(CreatedAt)}: {CreatedAt}, {nameof(UpdatedAt)}: {UpdatedAt}";
+            }
+        }
+    }
+}
+EOF
+
+
+cat << EOF > App.Web/RedisModule.cs
+using System;
+using System.Collections.Generic;
+using Nancy;
+
+namespace App.Web
+{
+    public class RedisModule : NancyModule
+    {
+        public RedisModule() : base("/redis")
+        {
+            // this is very bad REST, I know
+            Get("/{key}/{value}", args =>
+            {
+                var key = args.key.ToString();
+                var value = args.value.ToString();
+
+                // https://github.com/redis/redis-rb/blob/master/lib/redis/client.rb#L408
+                // https://msdn.microsoft.com/en-us/library/system.uri(v=vs.110).aspx
+                // https://stackexchange.github.io/StackExchange.Redis/Configuration
+                var redisUrlString = Environment.GetEnvironmentVariable("REDIS_URL");
+                Console.WriteLine($"REDIS_URL from ENV: {redisUrlString}");
+                var redisUri = new Uri(redisUrlString);
+                var userInfo = redisUri.UserInfo.Split(':');
+                var redisConnString = $"{redisUri.Host}:{redisUri.Port},password={userInfo[1]}";
+                Console.WriteLine($"constructed redisConnString: {redisConnString}");
+
+                var redisConn = StackExchange.Redis.ConnectionMultiplexer.Connect(redisConnString);
+                var redisDb = redisConn.GetDatabase();
+                redisDb.StringSet(key, value);
+                var dict = new Dictionary<string, string>
+                {
+                    {args.key, redisDb.StringGet(key)},
+                    {"ticks", DateTime.UtcNow.Ticks.ToString()},
+                };
+
+                // https://github.com/NancyFx/Nancy/wiki/Content-Negotiation
+                var response = Response.AsJson(dict);
+                response.ContentType = "application/json";
+                return response;
+            });
+        }
+    }
+}
+EOF
+
+
+# poor man's redis-cli
+echo "KEYS *" | nc -v localhost 6379
+echo "GET key1" | nc -v localhost 6379
+
+
+sudo apt-get install -y postgresql-client
+
+cat << EOF | psql -h localhost -p 5432 -U postgres
+CREATE TABLE things (
+ id UUID PRIMARY KEY,
+ name VARCHAR (255) NOT NULL,
+ enabled BOOLEAN NOT NULL DEFAULT 'f',
+ created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+ updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+EOF
+
+echo "SELECT * FROM things;" | psql -h localhost -p 5432 -U postgres
+
+
+heroku plugins:install heroku-redis
+
+# https://elements.heroku.com/addons/heroku-redis
+# https://devcenter.heroku.com/articles/heroku-redis#provisioning-the-add-on
+# must add billing info before you can provision this
+heroku addons:create heroku-redis:hobby-dev -a rogusdev-docker-heroku-dotnet
+
+heroku redis:credentials -a rogusdev-docker-heroku-dotnet
+
+# https://elements.heroku.com/addons/heroku-postgresql
+# https://devcenter.heroku.com/articles/heroku-postgresql#version-support-and-legacy-infrastructure
+heroku addons:create heroku-postgresql:hobby-dev -a rogusdev-docker-heroku-dotnet
+# --version 9.6
+# ^ specifying version gasve me 9.6.1, without specifying it gave me 9.6.4
+# -- trying to specify minor version threw an error about not available
+
+heroku pg:psql -a rogusdev-docker-heroku-dotnet
+
 ```
