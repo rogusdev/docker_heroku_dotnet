@@ -26,6 +26,7 @@ vagrant ssh
 cat << EOF > .env
 PORT=5000
 DATABASE_URL=postgres://postgres:@postgres:5432
+#DATABASE_URL=Host=localhost;Username=postgres;Password=postgres;Database=postgres
 REDIS_URL=redis://:@redis:6379
 EOF
 
@@ -40,6 +41,7 @@ cat << EOF > .dockerignore
 .vs
 .vscode
 docker-compose.yml
+Dockerfile
 **/bin/
 **/obj/
 EOF
@@ -49,6 +51,7 @@ wget https://raw.githubusercontent.com/github/gitignore/master/VisualStudio.giti
 cat << EOF >> .gitignore
 .DS_Store
 .env
+.idea
 .vagrant
 .vscode
 **/bin/
@@ -80,6 +83,10 @@ cat << EOF > app.json
 }
 EOF
 
+cat << EOF > Procfile
+web: dotnet App.Web.dll
+EOF
+
 
 cat << EOF > Dockerfile
 # https://docs.docker.com/engine/examples/dotnetcore/#create-a-dockerfile-for-an-aspnet-core-application
@@ -88,7 +95,7 @@ cat << EOF > Dockerfile
 # https://docs.microsoft.com/en-us/dotnet/core/docker/building-net-docker-images
 # https://docs.microsoft.com/en-us/dotnet/core/deploying/index
 # https://github.com/dotnet/dotnet-docker-samples/tree/master/aspnetapp
-FROM microsoft/aspnetcore-build:2.0.3 AS build-env
+FROM microsoft/aspnetcore-build:2.1.3 AS build-env
 WORKDIR /app
 
 COPY *.sln .
@@ -100,7 +107,7 @@ COPY . .
 RUN dotnet publish -c Release -o out \
     && touch App.Web/out/.env
 
-FROM microsoft/aspnetcore:2.0.3
+FROM microsoft/aspnetcore:2.1.3
 WORKDIR /app
 COPY --from=build-env /app/App.Web/out .
 
@@ -108,11 +115,16 @@ COPY --from=build-env /app/App.Web/out .
 # Heroku will not accept an empty array CMD! -- must pass empty string inside
 # but it actually just straight up ignores ENTRYPOINT anyway!  grr
 CMD ["dotnet", "App.Web.dll"]
+#ENTRYPOINT ["dotnet", "FudgyCron.Web.dll"]
 #CMD [""]
+
+# http://localhost:5000/Content/index.html
 EOF
 
 
 cat << EOF > docker-compose.yml
+# https://blog.codeship.com/running-rails-development-environment-docker/
+# https://nickjanetakis.com/blog/dockerize-a-rails-5-postgres-redis-sidekiq-action-cable-app-with-docker-compose
 version: '3'
 services:
   postgres:
@@ -123,8 +135,23 @@ services:
     image: redis:4.0.2
     ports:
      - "6379:6379"
+  zookeeper:
+    image: zookeeper:3.4
+    ports:
+      - "2181:2181"
+  kafka:
+    image: wurstmeister/kafka:0.11.0.1
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ADVERTISED_HOST_NAME: localhost
+      KAFKA_CREATE_TOPICS: "test:1:1,recipes-v1:1:1:compact,triggers-v1:1:1,events-v1:1:1"
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
   web:
     build: .
+    # using local dir as a volume instead of copying means no re-build for changes
+    #  but still need copy in the dockerfile for deployment -- tho it will remove dockerignore files!
+    # FIXME: confirm the dockerignore is ignored for compose -- try docker-compose run app ls -la or something
     ports:
       - "5000:5000"
     env_file: ".env"
@@ -134,17 +161,17 @@ services:
 EOF
 
 
-docker run --rm -it -v /vagrant:/app microsoft/aspnetcore-build:2.0.3 sh -c 'cd /app; bash'
+docker run --rm -it -v /vagrant:/app microsoft/aspnetcore-build:2.1.3 sh -c 'cd /app; bash'
 
 
 # inside the new shell:
 
 dotnet new sln -n App
 
-dotnet new web -f netcoreapp2.0 -n App.Web
+dotnet new web -f netcoreapp2.1 -n App.Web
 dotnet sln add App.Web/App.Web.csproj
 
-dotnet new xunit -f netcoreapp2.0 -n App.Tests
+dotnet new xunit -f netcoreapp2.1 -n App.Tests
 dotnet add ./App.Tests package xunit --version 2.3.1  # update the version
 dotnet add ./App.Tests package FakeItEasy --version 4.2.0
 dotnet add ./App.Tests package Nancy.Testing --version 2.0.0-clienteastwood
